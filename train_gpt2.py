@@ -224,7 +224,6 @@ if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
-device = 'cpu'
 print(f"using device: {device}")
 
 train_loader = DataLoaderLite(B=16, T=1024)
