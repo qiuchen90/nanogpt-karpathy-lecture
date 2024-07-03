@@ -6,7 +6,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+import tiktoken
+import time
 
 @dataclass
 
@@ -91,6 +92,8 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
 
 class GPT(nn.Module):
 
@@ -105,8 +108,22 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # init params
+        self.apply(self._init_weights)
     
-    def forward(self, idx):
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, target=None):
         # idx is of shape (B, T)
         B, T = idx.shape
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -120,7 +137,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None 
+        if target is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return logits, loss
 
 
     @classmethod
@@ -172,28 +192,88 @@ class GPT(nn.Module):
 
         return model
 
-num_return_sequences = 5
-max_length = 30
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        with open('input.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
+        # state
+        self.current_position = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = torch.tensor(self.tokens[self.current_position: self.current_position + B*T +1])
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
 
-import tiktoken
-import numpy as np
 
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) 
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
+# Auto detect device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+
+train_loader = DataLoaderLite(B=8, T=1024)
+torch.set_float32_matmul_precision('high')
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+model.eval()
+model.to(device)
+model = torch.compile(model)
+
+# logits, loss = model(x, y)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+        import code; code.interact(local=locals())
+    loss.backward()
+    optimizer.step()
+
+    if device == "cuda":
+        torch.cuda.synchronize() # wait for the GPU to finish work
+    t1 = time.time()
+    dt = (t1 - t0)*1000 
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt}ms, tok/sec: {tokens_per_sec}") # 
+
+import sys; sys.exit(0)
+
+
+num_return_sequences = 5
+max_length = 30
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) 
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to(device)
+
 
 while x.size(1) < max_length:
+    print(x.size())
     # forward the model to get the logits
     with torch.no_grad():
         logits = model(x) # (B, T, vocab_size)
@@ -210,7 +290,7 @@ while x.size(1) < max_length:
         # gather the corresponding indices
         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
         # append to the sequence
-        xgen = torch.cat((x, xcol), dim=1)
+        x = torch.cat((x, xcol), dim=1)
 
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
