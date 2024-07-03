@@ -224,9 +224,10 @@ if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
+device = 'cpu'
 print(f"using device: {device}")
 
-train_loader = DataLoaderLite(B=8, T=1024)
+train_loader = DataLoaderLite(B=16, T=1024)
 torch.set_float32_matmul_precision('high')
 
 torch.manual_seed(1337)
@@ -234,13 +235,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
 model = torch.compile(model)
 
 # logits, loss = model(x, y)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
@@ -250,6 +251,7 @@ for i in range(50):
         logits, loss = model(x, y)
         import code; code.interact(local=locals())
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
 
     if device == "cuda":
@@ -257,7 +259,7 @@ for i in range(50):
     t1 = time.time()
     dt = (t1 - t0)*1000 
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt}ms, tok/sec: {tokens_per_sec}") # 
+    print(f"step {i}, loss: {loss.item()}, norm: {norm:.4f}, dt: {dt}ms, tok/sec: {tokens_per_sec}") # 
 
 import sys; sys.exit(0)
 
